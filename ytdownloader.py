@@ -1,12 +1,6 @@
 import streamlit as st
 import yt_dlp
-from pathlib import Path
-import platform
-
-
-def get_downloads_folder():
-
-    return Path.home() / 'Downloads'
+import os
 
 
 def on_progress(d):
@@ -17,22 +11,30 @@ def on_progress(d):
 
 def download_video(url):
     try:
-        downloads_dir = get_downloads_folder()
-        downloads_dir.mkdir(parents=True, exist_ok=True)
-        st.info(f"📁 Downloading to: {downloads_dir}")
-
         ydl_opts = {
-      
             'format': 'best[ext=mp4]/best',
-            'progress_hooks': [on_progress],
-            'outtmpl': str(downloads_dir / '%(title)s.%(ext)s'),
             'quiet': True,
+            'progress_hooks': [on_progress],
+            'outtmpl': '%(title)s.%(ext)s',
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
 
-        st.success("✅ Download completed! Check your Downloads folder.")
+        st.success("✅ Download completed!")
+
+        # Read the downloaded video and offer it as a downloadable file
+        with open(filename, "rb") as f:
+            st.download_button(
+                label="⬇️ Click to Download Video",
+                data=f,
+                file_name=os.path.basename(filename),
+                mime="video/mp4"
+            )
+
+
+
     except Exception as e:
         st.error(f"❌ An error occurred: {e}")
 
