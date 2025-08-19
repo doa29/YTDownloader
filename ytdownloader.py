@@ -84,7 +84,8 @@ def run_download(u: str):
     last_err = None
     for order in clients_orders:
         opts = dict(base_opts)
-        opts["extractor_args"] = {"youtube": {"player_client": [order]}}
+        # FIX: pass the list directly
+        opts["extractor_args"] = {"youtube": {"player_client": order}}
         try:
             with YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(u, download=True)
