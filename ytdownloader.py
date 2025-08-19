@@ -1,6 +1,6 @@
 import streamlit as st
 import yt_dlp
-import os, shutil, platform, stat, tarfile, zipfile, tempfile
+import os, shutil, platform, stat, tarfile, zipfile
 from io import BytesIO
 from urllib.parse import urlparse
 from urllib.request import urlopen, Request
@@ -34,7 +34,7 @@ def make_progress_hook():
             bar.progress(100, text="Processing…")
     return _hook
 
-# fetch helper
+# small fetch helper
 def _http_get(url, chunk=1024*1024):
     req = Request(url, headers={"User-Agent":"Mozilla/5.0"})
     with urlopen(req, timeout=90) as r:
@@ -46,7 +46,7 @@ def _http_get(url, chunk=1024*1024):
         data.seek(0)
         return data
 
-# ffmpeg auto-setup
+# ffmpeg auto-setup (downloads a portable build into ./bin)
 def ensure_ffmpeg():
     if shutil.which("ffmpeg"): return None
     bin_dir = Path(__file__).parent / "bin"
@@ -89,19 +89,23 @@ def ensure_ffmpeg():
             try: p.unlink()
             except: pass
             return str(bin_dir)
-        except: continue
+        except:
+            continue
     return None
 
-# yt-dlp opts
-def build_ydl_opts(cookiefile_path: str|None, proxy_url: str|None):
+# build yt-dlp options (no cookies/proxy)
+def base_ydl_opts():
     try: loc = ensure_ffmpeg()
     except: loc = None
     has_ffmpeg = bool(loc or shutil.which("ffmpeg"))
 
-    extractor_args = {"youtube": {"player_client": ["android", "web"]}}
+    # try different clients to reduce 403
+    extractor_args = {"youtube": {"player_client": ["android", "web_embedded", "ios", "web"]}}
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.youtube.com/",
+        "Origin": "https://www.youtube.com",
     }
 
     if has_ffmpeg:
@@ -120,14 +124,18 @@ def build_ydl_opts(cookiefile_path: str|None, proxy_url: str|None):
         "extractor_args": extractor_args,
         "geo_bypass": True,
         "geo_bypass_country": "US",
+        "nocheckcertificate": True,
+        "retries": 10,
+        "fragment_retries": 10,
+        "continuedl": True,
+        "concurrent_fragment_downloads": 4,
+        "socket_timeout": 30,
     }
     if merge: opts["merge_output_format"] = merge
     if loc: opts["ffmpeg_location"] = loc
-    if cookiefile_path: opts["cookiefile"] = cookiefile_path
-    if proxy_url: opts["proxy"] = proxy_url.strip()
     return opts
 
-# file collector
+# collect output files
 def collect_files(ydl, obj):
     out = []
     if not obj: return out
@@ -138,18 +146,35 @@ def collect_files(ydl, obj):
         out.append(ydl.prepare_filename(obj))
     return out
 
-# download + serve
-def download_any(url: str, cookiefile_path: str|None, proxy_url: str|None):
-    try:
-        ydl_opts = build_ydl_opts(cookiefile_path, proxy_url)
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            files = collect_files(ydl, info)
+# run with a few fallback client profiles if needed
+CLIENT_TRIES = [
+    ["android", "web_embedded", "ios", "web"],
+    ["ios", "android", "web_embedded", "web"],
+    ["web", "android"],
+]
 
-        # only keep files that exist
+def download_any(url: str):
+    try:
+        last_err = None
+        files = []
+
+        for clients in CLIENT_TRIES:
+            opts = base_ydl_opts()
+            opts["extractor_args"] = {"youtube": {"player_client": clients}}
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    files = collect_files(ydl, info)
+                break
+            except yt_dlp.utils.DownloadError as e:
+                last_err = e
+                continue
+
         files = [f for f in files if f and os.path.exists(f)]
         if not files:
-            raise RuntimeError("No files were created (maybe blocked/restricted).")
+            if last_err:
+                raise last_err
+            raise RuntimeError("No files were created.")
 
         status_placeholder.success("✅ Done!")
 
@@ -168,24 +193,12 @@ def download_any(url: str, cookiefile_path: str|None, proxy_url: str|None):
 
     except yt_dlp.utils.DownloadError as e:
         status_placeholder.error("❌ Download error.")
-        st.caption(str(e))
+        st.caption(str(e))  # shows 403 reason if it happens
     except Exception as e:
         status_placeholder.error(f"❌ Error: {e}")
 
 # UI
 url = st.text_input("Enter YouTube URL")
-cookie_file = st.file_uploader("Optional cookies.txt (Netscape format)", type=["txt"])
-proxy = st.text_input("Optional proxy (http://user:pass@host:port)")
-
-cookie_path = None
-if cookie_file is not None:
-    try:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
-        tmp.write(cookie_file.read()); tmp.flush(); tmp.close()
-        cookie_path = tmp.name
-    except:
-        cookie_path = None
-
 if st.button("Download"):
     progress_placeholder.empty()
     status_placeholder.empty()
@@ -194,4 +207,4 @@ if st.button("Download"):
     elif not is_valid_youtube_url(url.strip()):
         st.warning("⚠️ Not a valid YouTube link.")
     else:
-        download_any(url.strip(), cookie_path, proxy.strip() or None)
+        download_any(url.strip())
