@@ -1,210 +1,136 @@
 import streamlit as st
-import yt_dlp
-import os, shutil, platform, stat, tarfile, zipfile
-from io import BytesIO
-from urllib.parse import urlparse
-from urllib.request import urlopen, Request
-from pathlib import Path
+import os, sys, shutil, io, zipfile, re
+from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
 
-st.set_page_config(page_title="YouTube Downloader", layout="centered")
-st.title("📥 YouTube Video & Playlist Downloader")
+# basic styles
+st.set_page_config(page_title="YouTube Downloader", page_icon="⬇️", layout="centered")
+st.title("YouTube Downloader")
+url = st.text_input("Enter YouTube URL")
+go = st.button("Download")
+bar = st.progress(0, text="Idle")
+msg = st.empty()
 
-# quick link check
-def is_valid_youtube_url(url: str) -> bool:
-    try:
-        u = urlparse(url)
-        h = (u.netloc or "").lower()
-        return ("youtube" in h) or ("youtu.be" in h)
-    except:
-        return False
+# helpers
+YT_HOSTS = ("youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "music.youtube.com")
+def looks_like_youtube(u: str) -> bool:
+    return any(h in u for h in YT_HOSTS)
 
-progress_placeholder = st.empty()
-status_placeholder = st.empty()
+def ffmpeg_available() -> bool:
+    return shutil.which("ffmpeg") is not None
 
-# progress bar
-def make_progress_hook():
-    bar = progress_placeholder.progress(0, text="Preparing…")
-    def _hook(d):
-        if d.get("status") == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            done = d.get("downloaded_bytes") or 0
-            pct = int(done * 100 / total) if total else 0
-            bar.progress(min(max(pct, 0), 100))
-        elif d.get("status") == "finished":
-            bar.progress(100, text="Processing…")
-    return _hook
+def safe_name(name: str) -> str:
+    name = os.path.basename(name)
+    name = re.sub(r"[\\/:*?\\\"<>|]+", "_", name)
+    name = re.sub(r"\\s+", " ", name).strip()
+    return name or "video.mp4"
 
-# small fetch helper
-def _http_get(url, chunk=1024*1024):
-    req = Request(url, headers={"User-Agent":"Mozilla/5.0"})
-    with urlopen(req, timeout=90) as r:
-        data = BytesIO()
-        while True:
-            b = r.read(chunk)
-            if not b: break
-            data.write(b)
-        data.seek(0)
-        return data
+def make_zip(paths):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for p in paths:
+            if os.path.exists(p):
+                z.write(p, arcname=safe_name(p))
+    buf.seek(0)
+    return buf
 
-# ffmpeg auto-setup (downloads a portable build into ./bin)
-def ensure_ffmpeg():
-    if shutil.which("ffmpeg"): return None
-    bin_dir = Path(__file__).parent / "bin"
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
-    ffmpeg_path = bin_dir / exe
-    if ffmpeg_path.exists(): return str(bin_dir)
+def collect_outputs_from_hook(d):
+    if d.get("status") == "downloading":
+        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+        done = d.get("downloaded_bytes") or 0
+        pct = int(done * 100 / total) if total else 0
+        bar.progress(min(max(pct, 0), 99), text=f"Downloading… {pct}%")
+    elif d.get("status") == "finished":
+        bar.progress(100, text="Processing…")
+        fn = d.get("filename")
+        if fn:
+            finished_files.add(fn)
 
-    sysname = platform.system().lower()
-    arch = platform.machine().lower()
-    if "windows" in sysname:
-        urls = ["https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"]
-    elif "darwin" in sysname or "mac" in sysname:
-        urls = ["https://evermeet.cx/ffmpeg/ffmpeg.zip"]
-    else:
-        urls = ["https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz"] if ("aarch64" in arch or "arm64" in arch) else ["https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"]
-
-    for u in urls:
-        try:
-            buf = _http_get(u)
-            name = u.split("/")[-1]
-            p = bin_dir / name
-            with open(p, "wb") as f: f.write(buf.read())
-            if name.endswith(".zip"):
-                with zipfile.ZipFile(p) as z:
-                    cand = [m for m in z.namelist() if m.endswith(exe)]
-                    if not cand: raise RuntimeError("ffmpeg not in zip")
-                    target = cand[0]
-                    z.extract(target, bin_dir)
-                    (bin_dir / target).rename(ffmpeg_path)
-            else:
-                with tarfile.open(p) as t:
-                    cand = [m for m in t.getmembers() if m.name.endswith(exe)]
-                    if not cand: raise RuntimeError("ffmpeg not in tar")
-                    m = cand[0]
-                    t.extract(m, bin_dir)
-                    (bin_dir / m.name).rename(ffmpeg_path)
-            try: ffmpeg_path.chmod(ffmpeg_path.stat().st_mode | stat.S_IEXEC)
-            except: pass
-            try: p.unlink()
-            except: pass
-            return str(bin_dir)
-        except:
-            continue
-    return None
-
-# build yt-dlp options (no cookies/proxy)
-def base_ydl_opts():
-    try: loc = ensure_ffmpeg()
-    except: loc = None
-    has_ffmpeg = bool(loc or shutil.which("ffmpeg"))
-
-    # try different clients to reduce 403
-    extractor_args = {"youtube": {"player_client": ["android", "web_embedded", "ios", "web"]}}
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.youtube.com/",
-        "Origin": "https://www.youtube.com",
-    }
-
-    if has_ffmpeg:
-        fmt = "bv*+ba/b"; merge = "mp4"
-    else:
-        fmt = "best[acodec!=none][vcodec!=none]/best[ext=mp4][acodec!=none][vcodec!=none]"; merge = None
-
-    opts = {
-        "format": fmt,
+def run_download(u: str):
+    clients_orders = [
+        ["android","web_embedded","ios","web"],
+        ["ios","web","android","web_embedded"],
+        ["web","android","ios","web_embedded"],
+    ]
+    base_opts = {
         "outtmpl": "%(title)s [%(id)s].%(ext)s",
-        "noplaylist": False,
-        "quiet": True,
-        "no_warnings": True,
-        "progress_hooks": [make_progress_hook()],
-        "http_headers": headers,
-        "extractor_args": extractor_args,
-        "geo_bypass": True,
-        "geo_bypass_country": "US",
-        "nocheckcertificate": True,
         "retries": 10,
         "fragment_retries": 10,
         "continuedl": True,
         "concurrent_fragment_downloads": 4,
         "socket_timeout": 30,
+        "quiet": True,
+        "no_warnings": True,
+        "geo_bypass": True,
+        "geo_bypass_country": "US",
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "*/*",
+            "Referer": "https://www.youtube.com/",
+        },
+        "progress_hooks": [collect_outputs_from_hook],
     }
-    if merge: opts["merge_output_format"] = merge
-    if loc: opts["ffmpeg_location"] = loc
-    return opts
-
-# collect output files
-def collect_files(ydl, obj):
-    out = []
-    if not obj: return out
-    if "entries" in obj and obj["entries"]:
-        for e in obj["entries"]:
-            if e: out += collect_files(ydl, e)
+    if ffmpeg_available():
+        base_opts.update({
+            "format": "bv*+ba/b",
+            "merge_output_format": "mp4",
+        })
     else:
-        out.append(ydl.prepare_filename(obj))
-    return out
+        base_opts.update({
+            "format": "best[acodec!=none][vcodec!=none]/best[ext=mp4][acodec!=none][vcodec!=none]",
+        })
 
-# run with a few fallback client profiles if needed
-CLIENT_TRIES = [
-    ["android", "web_embedded", "ios", "web"],
-    ["ios", "android", "web_embedded", "web"],
-    ["web", "android"],
-]
+    last_err = None
+    for order in clients_orders:
+        opts = dict(base_opts)
+        opts["extractor_args"] = {"youtube": {"player_client": [order]}}
+        try:
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(u, download=True)
+            return info
+        except DownloadError as e:
+            last_err = e
+            continue
+    if last_err:
+        raise last_err
 
-def download_any(url: str):
+# main
+if go:
+    if not url or not looks_like_youtube(url):
+        st.warning("Please enter a valid YouTube or youtu.be URL.")
+        st.stop()
+    bar.progress(0, text="Starting…")
+    msg.empty()
     try:
-        last_err = None
-        files = []
-
-        for clients in CLIENT_TRIES:
-            opts = base_ydl_opts()
-            opts["extractor_args"] = {"youtube": {"player_client": clients}}
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    files = collect_files(ydl, info)
-                break
-            except yt_dlp.utils.DownloadError as e:
-                last_err = e
-                continue
-
-        files = [f for f in files if f and os.path.exists(f)]
-        if not files:
-            if last_err:
-                raise last_err
-            raise RuntimeError("No files were created.")
-
-        status_placeholder.success("✅ Done!")
-
-        if len(files) == 1:
-            p = files[0]
-            with open(p, "rb") as f:
-                st.download_button("⬇️ Download Video", f,
-                    file_name=os.path.basename(p), mime="video/mp4")
+        global finished_files
+        finished_files = set()
+        info = run_download(url)
+        # collect from info as a backup
+        paths = set()
+        if "entries" in info and isinstance(info["entries"], list):
+            for e in info["entries"]:
+                fn = e.get("_filename") or e.get("requested_downloads",[{}])[0].get("filepath")
+                if fn:
+                    paths.add(fn)
         else:
-            buf = BytesIO()
-            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-                for p in files: z.write(p, os.path.basename(p))
-            buf.seek(0)
-            st.download_button(f"⬇️ Download {len(files)} videos as ZIP", buf,
-                file_name="youtube_videos.zip", mime="application/zip")
-
-    except yt_dlp.utils.DownloadError as e:
-        status_placeholder.error("❌ Download error.")
-        st.caption(str(e))  # shows 403 reason if it happens
+            fn = info.get("_filename") or info.get("requested_downloads",[{}])[0].get("filepath")
+            if fn:
+                paths.add(fn)
+        paths |= finished_files
+        paths = [p for p in paths if p and os.path.exists(p)]
+        if not paths:
+            raise RuntimeError("No files were created (maybe blocked/restricted).")
+        st.success("Done!")
+        if len(paths) == 1:
+            p = paths[0]
+            with open(p, "rb") as f:
+                st.download_button("⬇️ Download Video", data=f.read(), file_name=safe_name(p), mime="video/mp4")
+        else:
+            zipbuf = make_zip(paths)
+            st.download_button("⬇️ Download ZIP", data=zipbuf, file_name="playlist.zip", mime="application/zip")
+    except DownloadError as e:
+        st.error("❌ Download error.")
+        st.caption(str(e))
     except Exception as e:
-        status_placeholder.error(f"❌ Error: {e}")
-
-# UI
-url = st.text_input("Enter YouTube URL")
-if st.button("Download"):
-    progress_placeholder.empty()
-    status_placeholder.empty()
-    if not url.strip():
-        st.warning("⚠️ Please enter a URL.")
-    elif not is_valid_youtube_url(url.strip()):
-        st.warning("⚠️ Not a valid YouTube link.")
-    else:
-        download_any(url.strip())
+        st.error(f"❌ Error: {e}")
