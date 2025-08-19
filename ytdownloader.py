@@ -9,6 +9,7 @@ from pathlib import Path
 st.set_page_config(page_title="YouTube Downloader", layout="centered")
 st.title("📥 YouTube Video & Playlist Downloader")
 
+# quick link check
 def is_valid_youtube_url(url: str) -> bool:
     try:
         u = urlparse(url)
@@ -20,6 +21,7 @@ def is_valid_youtube_url(url: str) -> bool:
 progress_placeholder = st.empty()
 status_placeholder = st.empty()
 
+# progress bar
 def make_progress_hook():
     bar = progress_placeholder.progress(0, text="Preparing…")
     def _hook(d):
@@ -32,6 +34,7 @@ def make_progress_hook():
             bar.progress(100, text="Processing…")
     return _hook
 
+# fetch helper
 def _http_get(url, chunk=1024*1024):
     req = Request(url, headers={"User-Agent":"Mozilla/5.0"})
     with urlopen(req, timeout=90) as r:
@@ -43,6 +46,7 @@ def _http_get(url, chunk=1024*1024):
         data.seek(0)
         return data
 
+# ffmpeg auto-setup
 def ensure_ffmpeg():
     if shutil.which("ffmpeg"): return None
     bin_dir = Path(__file__).parent / "bin"
@@ -88,12 +92,12 @@ def ensure_ffmpeg():
         except: continue
     return None
 
+# yt-dlp opts
 def build_ydl_opts(cookiefile_path: str|None, proxy_url: str|None):
     try: loc = ensure_ffmpeg()
     except: loc = None
     has_ffmpeg = bool(loc or shutil.which("ffmpeg"))
 
-    # use android client first to dodge some 403s
     extractor_args = {"youtube": {"player_client": ["android", "web"]}}
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
@@ -109,14 +113,8 @@ def build_ydl_opts(cookiefile_path: str|None, proxy_url: str|None):
         "format": fmt,
         "outtmpl": "%(title)s [%(id)s].%(ext)s",
         "noplaylist": False,
-        "retries": 10,
-        "fragment_retries": 10,
-        "continuedl": True,
-        "concurrent_fragment_downloads": 4,
-        "socket_timeout": 30,
         "quiet": True,
         "no_warnings": True,
-        "ignoreerrors": "only_download",
         "progress_hooks": [make_progress_hook()],
         "http_headers": headers,
         "extractor_args": extractor_args,
@@ -129,6 +127,7 @@ def build_ydl_opts(cookiefile_path: str|None, proxy_url: str|None):
     if proxy_url: opts["proxy"] = proxy_url.strip()
     return opts
 
+# file collector
 def collect_files(ydl, obj):
     out = []
     if not obj: return out
@@ -139,6 +138,7 @@ def collect_files(ydl, obj):
         out.append(ydl.prepare_filename(obj))
     return out
 
+# download + serve
 def download_any(url: str, cookiefile_path: str|None, proxy_url: str|None):
     try:
         ydl_opts = build_ydl_opts(cookiefile_path, proxy_url)
@@ -146,43 +146,46 @@ def download_any(url: str, cookiefile_path: str|None, proxy_url: str|None):
             info = ydl.extract_info(url, download=True)
             files = collect_files(ydl, info)
 
-        if not files: raise RuntimeError("No files created.")
+        # only keep files that exist
+        files = [f for f in files if f and os.path.exists(f)]
+        if not files:
+            raise RuntimeError("No files were created (maybe blocked/restricted).")
+
         status_placeholder.success("✅ Done!")
 
         if len(files) == 1:
             p = files[0]
             with open(p, "rb") as f:
-                st.download_button("⬇️ Download Video", f, file_name=os.path.basename(p), mime="video/mp4")
+                st.download_button("⬇️ Download Video", f,
+                    file_name=os.path.basename(p), mime="video/mp4")
         else:
             buf = BytesIO()
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-                for p in files:
-                    if p and os.path.exists(p): z.write(p, os.path.basename(p))
+                for p in files: z.write(p, os.path.basename(p))
             buf.seek(0)
-            st.download_button(f"⬇️ Download {len(files)} videos as ZIP", buf, file_name="youtube_videos.zip", mime="application/zip")
+            st.download_button(f"⬇️ Download {len(files)} videos as ZIP", buf,
+                file_name="youtube_videos.zip", mime="application/zip")
+
     except yt_dlp.utils.DownloadError as e:
         status_placeholder.error("❌ Download error.")
-        st.caption(str(e))  # actual reason (helps with 403)
+        st.caption(str(e))
     except Exception as e:
         status_placeholder.error(f"❌ Error: {e}")
 
-# inputs
+# UI
 url = st.text_input("Enter YouTube URL")
 cookie_file = st.file_uploader("Optional cookies.txt (Netscape format)", type=["txt"])
-proxy = st.text_input("Optional proxy (e.g. http://user:pass@host:port)")
+proxy = st.text_input("Optional proxy (http://user:pass@host:port)")
 
-# handle cookies file
 cookie_path = None
 if cookie_file is not None:
     try:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
-        tmp.write(cookie_file.read())
-        tmp.flush(); tmp.close()
+        tmp.write(cookie_file.read()); tmp.flush(); tmp.close()
         cookie_path = tmp.name
     except:
         cookie_path = None
 
-# button
 if st.button("Download"):
     progress_placeholder.empty()
     status_placeholder.empty()
