@@ -1,3 +1,4 @@
-streamlit
-yt-dlp
+streamlit>=1.36
+yt-dlp>=2024.10.22
 pytube
+
