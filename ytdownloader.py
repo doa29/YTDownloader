@@ -1,6 +1,6 @@
 import streamlit as st
 import yt_dlp
-import os, shutil, platform, stat, tarfile, zipfile
+import os, shutil, platform, stat, tarfile, zipfile, tempfile
 from io import BytesIO
 from urllib.parse import urlparse
 from urllib.request import urlopen, Request
@@ -53,16 +53,12 @@ def ensure_ffmpeg():
 
     sysname = platform.system().lower()
     arch = platform.machine().lower()
-
     if "windows" in sysname:
         urls = ["https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"]
     elif "darwin" in sysname or "mac" in sysname:
         urls = ["https://evermeet.cx/ffmpeg/ffmpeg.zip"]
     else:
-        if "aarch64" in arch or "arm64" in arch:
-            urls = ["https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz"]
-        else:
-            urls = ["https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"]
+        urls = ["https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz"] if ("aarch64" in arch or "arm64" in arch) else ["https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"]
 
     for u in urls:
         try:
@@ -92,24 +88,45 @@ def ensure_ffmpeg():
         except: continue
     return None
 
-def build_ydl_opts():
+def build_ydl_opts(cookiefile_path: str|None, proxy_url: str|None):
     try: loc = ensure_ffmpeg()
     except: loc = None
     has_ffmpeg = bool(loc or shutil.which("ffmpeg"))
+
+    # use android client first to dodge some 403s
+    extractor_args = {"youtube": {"player_client": ["android", "web"]}}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
     if has_ffmpeg:
         fmt = "bv*+ba/b"; merge = "mp4"
     else:
         fmt = "best[acodec!=none][vcodec!=none]/best[ext=mp4][acodec!=none][vcodec!=none]"; merge = None
+
     opts = {
         "format": fmt,
         "outtmpl": "%(title)s [%(id)s].%(ext)s",
         "noplaylist": False,
+        "retries": 10,
+        "fragment_retries": 10,
+        "continuedl": True,
+        "concurrent_fragment_downloads": 4,
+        "socket_timeout": 30,
         "quiet": True,
         "no_warnings": True,
+        "ignoreerrors": "only_download",
         "progress_hooks": [make_progress_hook()],
+        "http_headers": headers,
+        "extractor_args": extractor_args,
+        "geo_bypass": True,
+        "geo_bypass_country": "US",
     }
     if merge: opts["merge_output_format"] = merge
     if loc: opts["ffmpeg_location"] = loc
+    if cookiefile_path: opts["cookiefile"] = cookiefile_path
+    if proxy_url: opts["proxy"] = proxy_url.strip()
     return opts
 
 def collect_files(ydl, obj):
@@ -122,9 +139,9 @@ def collect_files(ydl, obj):
         out.append(ydl.prepare_filename(obj))
     return out
 
-def download_any(url: str):
+def download_any(url: str, cookiefile_path: str|None, proxy_url: str|None):
     try:
-        ydl_opts = build_ydl_opts()
+        ydl_opts = build_ydl_opts(cookiefile_path, proxy_url)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             files = collect_files(ydl, info)
@@ -143,14 +160,29 @@ def download_any(url: str):
                     if p and os.path.exists(p): z.write(p, os.path.basename(p))
             buf.seek(0)
             st.download_button(f"⬇️ Download {len(files)} videos as ZIP", buf, file_name="youtube_videos.zip", mime="application/zip")
-
     except yt_dlp.utils.DownloadError as e:
         status_placeholder.error("❌ Download error.")
-        st.caption(str(e))
+        st.caption(str(e))  # actual reason (helps with 403)
     except Exception as e:
         status_placeholder.error(f"❌ Error: {e}")
 
+# inputs
 url = st.text_input("Enter YouTube URL")
+cookie_file = st.file_uploader("Optional cookies.txt (Netscape format)", type=["txt"])
+proxy = st.text_input("Optional proxy (e.g. http://user:pass@host:port)")
+
+# handle cookies file
+cookie_path = None
+if cookie_file is not None:
+    try:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+        tmp.write(cookie_file.read())
+        tmp.flush(); tmp.close()
+        cookie_path = tmp.name
+    except:
+        cookie_path = None
+
+# button
 if st.button("Download"):
     progress_placeholder.empty()
     status_placeholder.empty()
@@ -159,4 +191,4 @@ if st.button("Download"):
     elif not is_valid_youtube_url(url.strip()):
         st.warning("⚠️ Not a valid YouTube link.")
     else:
-        download_any(url.strip())
+        download_any(url.strip(), cookie_path, proxy.strip() or None)
